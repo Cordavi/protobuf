@@ -37,8 +37,9 @@
 #include "conformance/global_test_environment.h"
 #include "conformance/matchers.h"
 #include "conformance/mock_test_runner.h"
+#include "conformance/result_ledger.h"
+#include "conformance/result_listener.h"
 #include "conformance/test_environment_testing.h"
-#include "conformance/test_manager.h"
 #include "conformance/testee.h"
 #include "google/protobuf/test_messages_proto3.pb.h"
 #include "google/protobuf/text_format.h"
@@ -53,9 +54,13 @@ using ::google::protobuf::conformance::internal::ConformanceEnvironment;
 using ::google::protobuf::conformance::internal::ConformanceEnvironmentOptions;
 using ::protobuf_test_messages::proto3::TestAllTypesProto3;
 using ::testing::_;
+using ::testing::Contains;
+using ::testing::ElementsAre;
 using ::testing::HasSubstr;
+using ::testing::IsEmpty;
 using ::testing::NiceMock;
 using ::testing::Not;
+using ::testing::Pair;
 using ::testing::Return;
 
 // The name the testee sees for a kP0 test named "Foo" that parses
@@ -160,6 +165,47 @@ class ScopedWorkingDirectory {
   std::string old_directory_;
 };
 
+// The messages of the failures in `failures`.
+std::vector<std::string> Messages(
+    const testing::TestPartResultArray& failures) {
+  std::vector<std::string> messages;
+  for (int i = 0; i < failures.size(); ++i) {
+    messages.push_back(failures.GetTestPartResult(i).message());
+  }
+  return messages;
+}
+
+// The properties of `result`, as (key, value) pairs.
+std::vector<std::pair<std::string, std::string>> Properties(
+    const testing::TestResult& result) {
+  std::vector<std::pair<std::string, std::string>> properties;
+  for (int i = 0; i < result.test_property_count(); ++i) {
+    const testing::TestProperty& property = result.GetTestProperty(i);
+    properties.emplace_back(property.key(), property.value());
+  }
+  return properties;
+}
+
+// Runs ReportUncheckedResults() on `env` and returns the messages of the
+// failures it reports.
+std::vector<std::string> UncheckedResultFailures(ConformanceEnvironment& env) {
+  testing::TestPartResultArray failures;
+  {
+    testing::ScopedFakeTestPartResultReporter reporter(
+        testing::ScopedFakeTestPartResultReporter::
+            INTERCEPT_ONLY_CURRENT_THREAD,
+        &failures);
+    env.ReportUncheckedResults();
+  }
+  return Messages(failures);
+}
+
+// Creates a kP0 test named `name` against the global testee, as the fixture's
+// Testee() would.
+internal::Test CreateP0Test(absl::string_view name) {
+  return ConformanceEnvironment::Get().testee().CreateTest(name, kP0);
+}
+
 // Tears down `env` in a full run, expecting it to report unseen expected
 // failures with a message containing `expected_message`.
 void TearDownExpectingUnseenFailures(ConformanceEnvironment& env,
@@ -233,23 +279,26 @@ class ConformanceEnvironmentTest : public ::testing::Test {
 
 TEST_F(ConformanceEnvironmentTest, ScopedEnvironmentIsTheGlobalOne) {
   internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&fake_runner_});
-  EXPECT_EQ(&internal::GetGlobalTestManager(), &env->test_manager());
+  EXPECT_EQ(&internal::GetGlobalFailureList(), &env->ledger().failure_list());
 }
 
-TEST_F(ConformanceEnvironmentTest, EnforcementLevelIsPassedToTestManager) {
+TEST_F(ConformanceEnvironmentTest, EnforcementLevelIsPassedToTheFailureList) {
   {
     // Every priority is enforced by default.
     internal::ScopedGlobalConformanceEnvironment env(
         {/*runner=*/&fake_runner_});
-    EXPECT_THAT(env->test_manager().ReportFailure("P1.x", kP1, "boom"),
-                Not(IsOk()));
+    EXPECT_THAT(
+        env->ledger().failure_list().VerdictOnFailure("P1.x", kP1, "boom"),
+        Not(IsOk()));
   }
   {
     ConformanceEnvironmentOptions options;
     options.runner = &fake_runner_;
     options.enforcement_level = kP0;
     internal::ScopedGlobalConformanceEnvironment env(std::move(options));
-    EXPECT_THAT(env->test_manager().ReportFailure("P1.x", kP1, "boom"), IsOk());
+    EXPECT_THAT(
+        env->ledger().failure_list().VerdictOnFailure("P1.x", kP1, "boom"),
+        IsOk());
   }
 }
 
@@ -262,9 +311,8 @@ TEST_F(ConformanceEnvironmentTest, TesteeRoutesToRunner) {
       .WillOnce(Return(SerializedResponse(R"pb(protobuf_payload: "\010c")pb")));
   EXPECT_THAT(RunP0("Foo"),
               Yields(WhenParsed(EqualsTextProto(R"pb(optional_int32: 99)pb"))));
-
-  EXPECT_EQ(env->test_manager().expected_successes(), 1);
-  EXPECT_EQ(env->test_manager().unexpected_failures(), 0);
+  EXPECT_EQ(env->ledger().expected_successes(), 1);
+  EXPECT_EQ(env->ledger().unexpected_failures(), 0);
   env->TearDown();
 }
 
@@ -275,8 +323,164 @@ TEST_F(ConformanceEnvironmentTest, UnexpectedFailureFailsTheTest) {
   EXPECT_NONFATAL_FAILURE(EXPECT_THAT(RunP0("Foo"), Yields(IsParseError())),
                           "Should have failed to parse, but didn't.");
 
-  EXPECT_EQ(env->test_manager().unexpected_failures(), 1);
+  EXPECT_EQ(env->ledger().unexpected_failures(), 1);
   env->TearDown();
+}
+
+TEST_F(ConformanceEnvironmentTest, ResultsThatAreNeverCheckedFailTheTest) {
+  internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&fake_runner_});
+  env->SetUp();
+
+  // A discarded result and one checked with a bare leaf matcher both leave
+  // the ResultLedger in the dark; only what Yields() records reaches it.
+  RunP0("Foo");
+  EXPECT_THAT(RunP0("Bar"), Not(IsParseError()));
+  EXPECT_THAT(RunP0("Baz"),
+              Yields(WhenParsed(EqualsTextProto(R"pb(optional_int32: 99)pb"))));
+
+  EXPECT_THAT(
+      UncheckedResultFailures(env.environment()),
+      ElementsAre(HasSubstr(absl::StrCat(
+                      "TestResult for ", kFooTestName,
+                      " was never checked; wrap the matcher in Yields()")),
+                  HasSubstr(absl::StrCat(
+                      "TestResult for ", kBarTestName,
+                      " was never checked; wrap the matcher in Yields()"))));
+  // Each result is reported once.
+  EXPECT_THAT(UncheckedResultFailures(env.environment()), IsEmpty());
+  env->TearDown();
+}
+
+TEST_F(ConformanceEnvironmentTest,
+       UncheckedResultsAreBlamedOnTheTestThatRanThem) {
+  internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&fake_runner_});
+  env->SetUp();
+  RunP0("Foo");
+
+  const testing::TestInfo& test_info =
+      *testing::UnitTest::GetInstance()->current_test_info();
+  testing::TestPartResultArray failures;
+  {
+    testing::ScopedFakeTestPartResultReporter reporter(
+        testing::ScopedFakeTestPartResultReporter::
+            INTERCEPT_ONLY_CURRENT_THREAD,
+        &failures);
+    env->ReportUncheckedResults(&test_info);
+  }
+  ASSERT_EQ(failures.size(), 1);
+  EXPECT_STREQ(failures.GetTestPartResult(0).file_name(), test_info.file());
+  EXPECT_EQ(failures.GetTestPartResult(0).line_number(), test_info.line());
+  env->TearDown();
+}
+
+TEST_F(ConformanceEnvironmentTest, TearDownReportsResultsThatWereNeverChecked) {
+  internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&fake_runner_});
+  env->SetUp();
+  RunP0("Foo");
+  EXPECT_NONFATAL_FAILURE(
+      env->TearDown(),
+      absl::StrCat("TestResult for ", kFooTestName,
+                   " was never checked; wrap the matcher in Yields()"));
+}
+
+TEST_F(ConformanceEnvironmentTest, ReportUncheckedResultsIsANoOpAfterTearDown) {
+  internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&fake_runner_});
+  env->SetUp();
+  env->TearDown();
+  EXPECT_THAT(UncheckedResultFailures(env.environment()), IsEmpty());
+}
+
+TEST_F(ConformanceEnvironmentTest, YieldsReportsToTheEnvironmentsLedger) {
+  internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&fake_runner_});
+  env->SetUp();
+
+  EXPECT_THAT(RunP0("Foo"), Yields(_));
+  EXPECT_TRUE(env->ledger().WasReported(kFooTestName));
+  EXPECT_EQ(env->ledger().expected_successes(), 1);
+  env->TearDown();
+}
+
+// The environment's ResultListener reports the statistics when a gtest test
+// or test suite ends (result_listener_test.cc drives it by hand), so this only
+// shows through an environment that outlives the test body, like the one a
+// test binary installs.  This suite keeps one alive across its tests, and
+// until the suite itself has ended, and inspects what the listener did after
+// each body has returned.  The failure the environment adds for an unchecked
+// result is a real one, so that is checked end to end in
+// test_environment_integration_test.cc instead.
+class LongLivedEnvironmentTest : public testing::Test {
+ protected:
+  struct SuiteState {
+    FakeTestRunner runner;
+    internal::ScopedGlobalConformanceEnvironment env{{/*runner=*/&runner}};
+  };
+
+  // Inspects the suite's properties once the suite has ended, then destroys
+  // the environment.  gtest tells its listeners about a suite ending in
+  // reverse order of registration, so this runs after the environment's
+  // listener as long as it is registered first.
+  class SuiteEndChecker : public testing::EmptyTestEventListener {
+   public:
+    explicit SuiteEndChecker(const testing::TestSuite* suite)
+        : suite_under_test_(suite) {}
+
+    void OnTestSuiteEnd(const testing::TestSuite& suite) override {
+      if (&suite != suite_under_test_ || suite_ == nullptr) return;
+      // The suite's own properties hold the statistics of the whole suite,
+      // including what SetUpTestSuite() checked.
+      std::vector<std::pair<std::string, std::string>> properties =
+          Properties(suite.ad_hoc_test_result());
+      EXPECT_THAT(properties, Contains(Pair("expected_successes", "2")));
+      EXPECT_THAT(properties, Contains(Pair("unexpected_failures", "0")));
+      delete suite_;
+      suite_ = nullptr;
+    }
+
+   private:
+    const testing::TestSuite* const suite_under_test_;
+  };
+
+  static void SetUpTestSuite() {
+    testing::UnitTest& unit_test = *testing::UnitTest::GetInstance();
+    // gtest owns the checker and deletes it when the program ends.
+    unit_test.listeners().Append(
+        new SuiteEndChecker(unit_test.current_test_suite()));
+    suite_ = new SuiteState();
+    // A result checked outside any test is the suite's.  It is tallied at
+    // once, before the first test starts, so it is neither counted toward that
+    // test's statistics nor reported as unchecked when it ends.
+    EXPECT_THAT(
+        ConformanceEnvironment::Get()
+            .testee()
+            .CreateTest("SetUpTestSuite", kP0)
+            .ParseBinary(TestAllTypesProto3::descriptor(), VarintField(1, 99))
+            .SerializeBinary(),
+        Yields(WhenParsed(EqualsTextProto(R"pb(optional_int32: 99)pb"))));
+  }
+
+  static void TearDownTestSuite() {
+    // The test's properties hold the statistics of the test alone.
+    const testing::TestSuite& suite =
+        *testing::UnitTest::GetInstance()->current_test_suite();
+    ASSERT_EQ(suite.total_test_count(), 1);
+    std::vector<std::pair<std::string, std::string>> properties =
+        Properties(*suite.GetTestInfo(0)->result());
+    EXPECT_THAT(properties, Contains(Pair("expected_successes", "1")));
+    EXPECT_THAT(properties, Contains(Pair("unexpected_failures", "0")));
+  }
+
+  static SuiteState* suite_;
+};
+
+LongLivedEnvironmentTest::SuiteState* LongLivedEnvironmentTest::suite_ =
+    nullptr;
+
+TEST_F(LongLivedEnvironmentTest, ReportsStatisticsWhenTheTestEnds) {
+  EXPECT_THAT(
+      CreateP0Test("Bar")
+          .ParseBinary(TestAllTypesProto3::descriptor(), VarintField(1, 99))
+          .SerializeBinary(),
+      Yields(WhenParsed(EqualsTextProto(R"pb(optional_int32: 99)pb"))));
 }
 
 TEST_F(ConformanceEnvironmentTest, ExpectedFailureFromFailureListPasses) {
@@ -291,8 +495,8 @@ TEST_F(ConformanceEnvironmentTest, ExpectedFailureFromFailureListPasses) {
 
   EXPECT_THAT(RunP0("Foo"), Yields(IsParseError()));
 
-  EXPECT_EQ(env->test_manager().expected_failures(), 1);
-  EXPECT_EQ(env->test_manager().unexpected_failures(), 0);
+  EXPECT_EQ(env->ledger().expected_failures(), 1);
+  EXPECT_EQ(env->ledger().unexpected_failures(), 0);
   env->TearDown();
 }
 
@@ -309,7 +513,7 @@ TEST_F(ConformanceEnvironmentTest, LoadsMultipleFailureLists) {
   EXPECT_THAT(RunP0("Foo"), Yields(IsParseError()));
   EXPECT_THAT(RunP0("Bar"), Yields(IsParseError()));
 
-  EXPECT_EQ(env->test_manager().expected_failures(), 2);
+  EXPECT_EQ(env->ledger().expected_failures(), 2);
   env->TearDown();
 }
 
@@ -348,9 +552,9 @@ TEST_F(ConformanceEnvironmentTest, P1FailureIsToleratedWhenNotEnforced) {
 
   EXPECT_THAT(RunP1("Foo"), Yields(IsParseError()));
 
-  EXPECT_EQ(env->test_manager().tolerated_failures(), 1);
-  EXPECT_EQ(env->test_manager().skipped(), 0);
-  EXPECT_EQ(env->test_manager().unexpected_failures(), 0);
+  EXPECT_EQ(env->ledger().tolerated_failures(), 1);
+  EXPECT_EQ(env->ledger().skipped(), 0);
+  EXPECT_EQ(env->ledger().unexpected_failures(), 0);
   env->TearDown();
 }
 
@@ -369,8 +573,8 @@ TEST_F(ConformanceEnvironmentTest,
 
   EXPECT_THAT(RunP1("Foo"), Yields(IsParseError()));
 
-  EXPECT_EQ(env->test_manager().expected_failures(), 1);
-  EXPECT_EQ(env->test_manager().tolerated_failures(), 0);
+  EXPECT_EQ(env->ledger().expected_failures(), 1);
+  EXPECT_EQ(env->ledger().tolerated_failures(), 0);
   // ...and so it isn't unseen either.
   internal::ScopedPartialRunOverride full_run(false);
   env->TearDown();
@@ -415,6 +619,28 @@ TEST_F(ConformanceEnvironmentTest, TearDownFailsOnUnseenExpectedFailures) {
                    "\nRemove them from the failure list, or rerun with --fix"));
 }
 
+TEST_F(ConformanceEnvironmentTest, TearDownFailsForAnOverexpandedWildcard) {
+  std::string entry = "Required.Proto3.ProtobufInput.*.ProtobufOutput";
+  std::string failure_list = WriteFile(
+      "failures.txt", absl::StrCat(entry, " # Should have failed to parse\n"));
+  ConformanceEnvironmentOptions options;
+  options.runner = &fake_runner_;
+  options.failure_list_files = {failure_list};
+  internal::ScopedGlobalConformanceEnvironment env(std::move(options));
+  env->SetUp();
+
+  // Each test is an expected failure; only their number is the problem.
+  for (int i = 0; i <= internal::kMaximumWildcardExpansions; ++i) {
+    EXPECT_THAT(RunP0(absl::StrCat("Test", i)), Yields(IsParseError()));
+  }
+
+  internal::ScopedPartialRunOverride full_run(false);
+  EXPECT_NONFATAL_FAILURE(
+      env->TearDown(),
+      absl::StrCat("The failure list entry ", entry, " matched more than ",
+                   internal::kMaximumWildcardExpansions, " tests"));
+}
+
 TEST_F(ConformanceEnvironmentTest, UnseenExpectedFailuresAreFineInPartialRun) {
   std::string failure_list =
       WriteFile("failures.txt", absl::StrCat(kFooTestName, "\n"));
@@ -426,8 +652,8 @@ TEST_F(ConformanceEnvironmentTest, UnseenExpectedFailuresAreFineInPartialRun) {
 
   internal::ScopedPartialRunOverride partial_run(true);
   env->TearDown();
-  EXPECT_THAT(env->test_manager().Finalize().message(),
-              HasSubstr(absl::StrCat("were not seen: ", kFooTestName)));
+  EXPECT_THAT(env->ledger().UnmatchedExpectedFailures(),
+              ElementsAre(kFooTestName));
 }
 
 TEST_F(ConformanceEnvironmentTest, UnseenCheckCanBeDisabled) {
@@ -442,8 +668,8 @@ TEST_F(ConformanceEnvironmentTest, UnseenCheckCanBeDisabled) {
 
   internal::ScopedPartialRunOverride full_run(false);
   env->TearDown();
-  EXPECT_THAT(env->test_manager().Finalize().message(),
-              HasSubstr(absl::StrCat("were not seen: ", kFooTestName)));
+  EXPECT_THAT(env->ledger().UnmatchedExpectedFailures(),
+              ElementsAre(kFooTestName));
 }
 
 TEST_F(ConformanceEnvironmentTest, FixWritesToTheOutputFile) {
@@ -627,7 +853,7 @@ TEST_F(ConformanceEnvironmentTest, FixReportsWriteFailures) {
 TEST_F(ConformanceEnvironmentTest, StatisticsSnapshotAndDelta) {
   internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&fake_runner_});
   env->SetUp();
-  internal::Statistics before = internal::Statistics::From(env->test_manager());
+  internal::Statistics before = internal::Statistics::From(env->ledger());
 
   EXPECT_THAT(RunP0("Foo"),
               Yields(WhenParsed(EqualsTextProto(R"pb(optional_int32: 99)pb"))));
@@ -635,7 +861,7 @@ TEST_F(ConformanceEnvironmentTest, StatisticsSnapshotAndDelta) {
                           "Should have failed to parse");
 
   internal::Statistics delta =
-      internal::Statistics::From(env->test_manager()) - before;
+      internal::Statistics::From(env->ledger()) - before;
   EXPECT_EQ(delta.expected_successes, 1);
   EXPECT_EQ(delta.unexpected_failures, 1);
   EXPECT_EQ(delta.expected_failures, 0);
@@ -661,7 +887,7 @@ TEST_F(ConformanceEnvironmentTest, StatisticsCountListedSkips) {
   options.failure_list_files = {failure_list};
   internal::ScopedGlobalConformanceEnvironment env(std::move(options));
   env->SetUp();
-  internal::Statistics before = internal::Statistics::From(env->test_manager());
+  internal::Statistics before = internal::Statistics::From(env->ledger());
 
   // A listed test the testee skips fails (see matchers.h) and is both a skip
   // and a listed skip, but neither an expected nor an unexpected anything.
@@ -672,7 +898,7 @@ TEST_F(ConformanceEnvironmentTest, StatisticsCountListedSkips) {
       "is in the failure list but was skipped by the testee");
 
   internal::Statistics delta =
-      internal::Statistics::From(env->test_manager()) - before;
+      internal::Statistics::From(env->ledger()) - before;
   EXPECT_EQ(delta.skipped_tests, 1);
   EXPECT_EQ(delta.listed_skips, 1);
   EXPECT_EQ(delta.expected_failures, 0);
@@ -731,7 +957,7 @@ TEST_F(ConformanceEnvironmentTest, TearDownShutsDownTheOwnedRunner) {
   env->TearDown();
   EXPECT_TRUE(destroyed);
   // The statistics survive the testee.
-  EXPECT_EQ(env->test_manager().expected_successes(), 1);
+  EXPECT_EQ(env->ledger().expected_successes(), 1);
 }
 
 TEST_F(ConformanceEnvironmentTest, TearDownWithoutSetUpOnlyReleasesTheTestee) {
@@ -755,7 +981,7 @@ TEST_F(ConformanceEnvironmentTest, TearDownWithoutSetUpOnlyReleasesTheTestee) {
   EXPECT_TRUE(destroyed);
   EXPECT_FALSE(File::Exists(fixed));
   EXPECT_THAT(ReadFile(failure_list), HasSubstr("never seen"));
-  EXPECT_EQ(env->test_manager().expected_failures(), 0);
+  EXPECT_EQ(env->ledger().expected_failures(), 0);
 }
 
 TEST_F(ConformanceEnvironmentTest, OwnedRunnerDiesWithTheEnvironment) {
@@ -771,6 +997,50 @@ TEST_F(ConformanceEnvironmentTest, OwnedRunnerDiesWithTheEnvironment) {
 
 TEST(ConformanceEnvironmentDeathTest, GetWithoutInstall) {
   EXPECT_DEATH(ConformanceEnvironment::Get(), "Install");
+}
+
+TEST(ConformanceEnvironmentDeathTest,
+     UncheckedResultsAreNotReportedAfterAFatalFailure) {
+  // An ASSERT_* that doesn't hold returns from the test before it can check
+  // its results.  A real (non-intercepted) fatal failure would fail this test,
+  // so the scenario runs in a death test child that exits with the number of
+  // stray failures.
+  FakeTestRunner runner;
+  EXPECT_EXIT(
+      {
+        internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&runner});
+        CreateP0Test("Foo")
+            .ParseBinary(TestAllTypesProto3::descriptor(), VarintField(1, 99))
+            .SerializeBinary();
+        // What ASSERT_* records before returning.
+        [] { FAIL() << "fatal failure"; }();
+        ABSL_CHECK(testing::Test::HasFatalFailure());
+        // std::exit() runs no destructors, so the mock is leaked on purpose.
+        testing::Mock::AllowLeak(&runner);
+        std::exit(static_cast<int>(
+            UncheckedResultFailures(env.environment()).size()));
+      },
+      testing::ExitedWithCode(0), "");
+}
+
+TEST(ConformanceEnvironmentDeathTest,
+     UncheckedResultsAreNotReportedAfterASkip) {
+  // Likewise for a GTEST_SKIP() that returned before the test could check its
+  // results.
+  FakeTestRunner runner;
+  EXPECT_EXIT(
+      {
+        internal::ScopedGlobalConformanceEnvironment env({/*runner=*/&runner});
+        CreateP0Test("Foo")
+            .ParseBinary(TestAllTypesProto3::descriptor(), VarintField(1, 99))
+            .SerializeBinary();
+        [] { GTEST_SKIP() << "skipped"; }();
+        ABSL_CHECK(testing::Test::IsSkipped());
+        testing::Mock::AllowLeak(&runner);
+        std::exit(static_cast<int>(
+            UncheckedResultFailures(env.environment()).size()));
+      },
+      testing::ExitedWithCode(0), "");
 }
 
 TEST(ConformanceEnvironmentDeathTest, RequiresExactlyOneTestee) {

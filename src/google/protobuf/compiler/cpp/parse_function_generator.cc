@@ -464,28 +464,22 @@ void ParseFunctionGenerator::GenerateFastFieldEntries(io::Printer* p) {
                 {$target$, {$coded_tag$, ::uint16_t{$nonfield_info$}}},
               )cc");
     } else if (auto* mp_field = info.AsMpField()) {
-      {
-        // TODO: refactor this to use Emit.
-        Formatter format(p, variables_);
-        PrintFieldComment(format, mp_field->field, options_);
-      }
-      p->Emit({{"target", TcParseFunctionName(mp_field->func)},
-               {"coded_tag", mp_field->coded_tag},
-               {"function_index", mp_field->function_index},
-               {"index", mp_field->field_index}},
-              R"cc(
-                {$target$,
-                 {$coded_tag$, ::uint8_t{$function_index$},
-                  ::uint32_t{
-                      PROTOBUF_FIELD_OFFSET(ParseTableT_, field_entries) +
-                      sizeof(_pbi::TcParseTableBase::FieldEntry) * $index$}}},
-              )cc");
+      p->Emit(
+          {{"comment",
+            [&] { PrintFieldComment(p, mp_field->field, options_); }},
+           {"target", TcParseFunctionName(mp_field->func)},
+           {"coded_tag", mp_field->coded_tag},
+           {"function_index", mp_field->function_index},
+           {"index", mp_field->field_index}},
+          R"cc(
+            $comment${
+                $target$,
+                {$coded_tag$, ::uint8_t{$function_index$},
+                 ::uint32_t{PROTOBUF_FIELD_OFFSET(ParseTableT_, field_entries) +
+                            sizeof(_pbi::TcParseTableBase::FieldEntry) *
+                                $index$}}},
+          )cc");
     } else if (auto* as_field = info.AsField()) {
-      {
-        // TODO: refactor this to use Emit.
-        Formatter format(p, variables_);
-        PrintFieldComment(format, as_field->field, options_);
-      }
       ABSL_CHECK(!ShouldSplit(as_field->field, options_));
 
       std::string func_name = TcParseFunctionName(as_field->func);
@@ -514,6 +508,8 @@ void ParseFunctionGenerator::GenerateFastFieldEntries(io::Printer* p) {
 
       p->Emit(
           {
+              {"comment",
+               [&] { PrintFieldComment(p, as_field->field, options_); }},
               {"target", func_name},
               {"coded_tag", as_field->coded_tag},
               {"hasbit_idx", as_field->hasbit_idx},
@@ -521,9 +517,9 @@ void ParseFunctionGenerator::GenerateFastFieldEntries(io::Printer* p) {
               {"field_name", FieldMemberName(as_field->field, /*split=*/false)},
           },
           R"cc(
-            {$target$,
-             {$coded_tag$, $hasbit_idx$, $aux_idx$,
-              PROTOBUF_FIELD_OFFSET($Msg$, $field_name$)}},
+            $comment${$target$,
+                      {$coded_tag$, $hasbit_idx$, $aux_idx$,
+                       PROTOBUF_FIELD_OFFSET($Msg$, $field_name$)}},
           )cc");
     } else {
       ABSL_DCHECK(info.is_empty());
@@ -537,9 +533,6 @@ void ParseFunctionGenerator::GenerateFastFieldEntries(io::Printer* p) {
 void ParseFunctionGenerator::GenerateFieldEntries(io::Printer* p) {
   for (const auto& entry : tc_table_info_->field_entries) {
     const FieldDescriptor* field = entry.field;
-    // TODO: refactor this to use Emit.
-    Formatter format(p, variables_);
-    PrintFieldComment(format, field, options_);
 
     bool weak = IsWeak(field, options_);
     bool split = ShouldSplit(field, options_);
@@ -549,7 +542,8 @@ void ParseFunctionGenerator::GenerateFieldEntries(io::Printer* p) {
         {{"field_name", FieldName(field)},
          {"field_member_name", FieldMemberName(field, /*split=*/false)}});
 
-    p->Emit({{"offset",
+    p->Emit({{"comment", [&] { PrintFieldComment(p, field, options_); }},
+             {"offset",
               [&] {
                 if (weak) {
                   p->Emit("/* weak */ 0,");
@@ -580,7 +574,7 @@ void ParseFunctionGenerator::GenerateFieldEntries(io::Printer* p) {
             // Use `0|` prefix to eagerly convert the enums to int to avoid
             // enum-enum operations. They are deprecated in C++20.
             R"cc(
-              {$offset$, $has_idx$, $aux_idx$, (0 | $type_card$)},
+              $comment${$offset$, $has_idx$, $aux_idx$, (0 | $type_card$)},
             )cc");
   }
 }

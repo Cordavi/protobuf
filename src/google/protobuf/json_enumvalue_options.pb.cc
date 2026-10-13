@@ -75,8 +75,8 @@ constexpr JsonEnumValueOptions::ParseTableT_ JsonEnumValueOptions::_Internal::Ge
     }, {{
       // string string = 1;
       {::_pbi::TcParser::FastUS1,
-       {10, 0, 0,
-        PROTOBUF_FIELD_OFFSET(JsonEnumValueOptions, _impl_.string_)}},
+                {10, 0, 0,
+                 PROTOBUF_FIELD_OFFSET(JsonEnumValueOptions, _impl_.string_)}},
     }}, {{
       65535, 65535
     }}, {{

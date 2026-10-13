@@ -74,8 +74,8 @@ constexpr CSharpFeatures::ParseTableT_ CSharpFeatures::_Internal::GenerateParseT
     }, {{
       // optional bool nullable_reference_types = 1 [retention = RETENTION_RUNTIME, targets = TARGET_TYPE_FIELD, targets = TARGET_TYPE_MESSAGE, targets = TARGET_TYPE_FILE, edition_defaults = {
       {::_pbi::TcParser::SingularVarintNoZag1<bool, offsetof(CSharpFeatures, _impl_.nullable_reference_types_), 0>(),
-       {8, 0, 0,
-        PROTOBUF_FIELD_OFFSET(CSharpFeatures, _impl_.nullable_reference_types_)}},
+                {8, 0, 0,
+                 PROTOBUF_FIELD_OFFSET(CSharpFeatures, _impl_.nullable_reference_types_)}},
     }}, {{
       65535, 65535
     }}, {{

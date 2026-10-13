@@ -75,8 +75,8 @@ constexpr CppFileOptions::ParseTableT_ CppFileOptions::_Internal::GenerateParseT
     }, {{
       // string namespace = 1;
       {::_pbi::TcParser::FastUS1,
-       {10, 0, 0,
-        PROTOBUF_FIELD_OFFSET(CppFileOptions, _impl_.namespace__)}},
+                {10, 0, 0,
+                 PROTOBUF_FIELD_OFFSET(CppFileOptions, _impl_.namespace__)}},
     }}, {{
       65535, 65535
     }}, {{
